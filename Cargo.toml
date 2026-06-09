@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "garam-daemon",
+    "garam-common",
+    "garam-ctl"
+]
+resolver = "3"

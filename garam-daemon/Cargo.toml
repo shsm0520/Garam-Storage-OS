@@ -1,0 +1,13 @@
+[package]
+name = "garam-daemon"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0" }
+toml = "0.8"
+log = "0.4"
+env_logger = "0.11"
+udev = "0.9.3"

@@ -1,4 +1,4 @@
 # 💾 가람OS 글로벌 시스템 설정 파일 (config.toml)
-hostname = "GaramOS-Core"
+hostname = "Garam-Storage-OS-Core"
 web_port = 8080
 socket_path = "/tmp/garamd.sock"

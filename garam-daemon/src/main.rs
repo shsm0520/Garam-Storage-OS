@@ -1,170 +1,289 @@
 mod hardware;
 mod storage;
+mod docker;
 
 use std::fs;
+use std::sync::Arc; 
 use std::time::{Duration, Instant};
-use tokio::net::UnixListener;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::RwLock; 
+use tokio::task::LocalSet; 
 use serde::Deserialize;
-use log::{info, warn, error};
-use udev::MonitorBuilder;
-use tokio::task::LocalSet;
+use serde_json::json; 
+use log::{ info, warn};
 
-// 동생 방들에서 공용(pub) 부품들 명확히 소환!
-use storage::{StorageBackend, zfs::ZfsBackend, ghs::GhsBackend, lvm::LvmBackend};
+use crate::hardware::boot::BootInspector;
+use crate::hardware::power::UpsController;
+use crate::hardware::sysmon::SystemMonitor;
 
-#[derive(Deserialize, Debug)]
+// 🔒 [바이너리 프레이밍 코덱 관로]
+use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec}; 
+use tokio_util::bytes::Bytes;
+use futures::{StreamExt, SinkExt}; 
+use nix::unistd::{chown, Group}; 
+
+#[derive(Deserialize, Debug, Clone)]
 struct SystemConfig {
     hostname: String,
     web_port: u16,
     socket_path: String,
+    allowed_uids: Vec<u32>,
+    enable_auto_mutation: bool, 
+    default_cpu_limit: f32,
+    default_memory_mb: u64,
+    authz_socket_path: String,
+    authz_socket_mode: u32,
+    authz_group_name: String,
+    disk_worker_socket_path: String,
+    storage_lock_path: String,
+    monitor_target_disk: String,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 struct IpcRequest {
     cmd: String,
     args: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SharedState {
+    cpu_usage: f32,
+    ram_used_mb: u64,
+    ram_total_mb: u64,
+    ram_pct: f32,
+    disk_temp: String,
+    ac_connected: bool,
+    battery_pct: u8,
+    ups_voltage: f32,
+    backup_time_left_min: u32,
+    active_disks: Vec<String>,
 }
 
 async fn run_daemon(config: SystemConfig) {
     let start_time = Instant::now();
     let version = env!("CARGO_PKG_VERSION");
 
-    info!("==================================================");
-    info!(" 가람OS 데몬 엔터프라이즈 네이티브 엔진 시동 완료");
-    info!("   • 호스트명       : {}", config.hostname);
-    info!("   • 웹 서비스 포트 : {}", config.web_port);
-    info!("   • 통신 소켓 채널 : Unix Socket ({})", config.socket_path);
-    info!("==================================================");
+    // 🔒 시스템 무결성 부팅 검증 레이어
+    if let Err(e) = BootInspector::verify_system_integrity() {
+        eprintln!("💀 [무결성 붕괴] 시스템 파일 변형 감지: {}", e);
+        std::process::exit(1); 
+    }
 
-    // 🔋 [신설 - 전원 안전조치 비동기 워치독] 메인 리스너와 별개로 5초마다 감시
-    tokio::task::spawn_local(async {
-        loop {
-            let power = hardware::power::fetch_power_status();
-            if !power.ac_online {
-                error!("🚨 [가람 위기 관리] 시스템 정전 발생!! UPS 배터리로 긴급 구동 중 (잔량: {}%)", power.battery_pct);
-                if power.battery_pct < 20 {
-                    error!("💀 배터리 임계치 위험선 돌파! 스토리지 커널 보호를 위해 세이프 셧다운을 선포합니다.");
-                    // std::process::Command::new("shutdown").arg("-h").arg("now").output();
-                }
-            }
-            tokio::time::sleep(Duration::from_secs(5)).await;
+    let initial_disks = hardware::disks::get_fresh_disk_list();
+
+    let shared_state = Arc::new(RwLock::new(SharedState {
+        cpu_usage: 0.0,
+        ram_used_mb: 0,
+        ram_total_mb: 0,
+        ram_pct: 0.0,
+        disk_temp: "N/A".to_string(),
+        ac_connected: true,
+        battery_pct: 100,
+        ups_voltage: 14.2,
+        backup_time_left_min: 180,
+        active_disks: initial_disks,
+    }));
+
+    // 🔒 [독점 싱글턴 가드 및 투명 프록시 라우터 타설]
+    let mut current_socket_path = config.socket_path.clone();
+    let mut is_proxy_mode = false;
+
+    if Path::new(&config.socket_path).exists() {
+        if UnixStream::connect(&config.socket_path).await.is_ok() {
+            warn!("⚠️ [프록시 모드 격발] 가람 데몬 원본(1호기)이 이미 활성화되어 있습니다.");
+            info!("🔰 본진 파괴를 막기 위해 2호기 엔진은 '투명 IPC 프록시 수송선'으로 보직 변경합니다.");
+            current_socket_path = format!("{}_{}", config.socket_path, uuid::Uuid::new_v4().to_string()[..4].to_string());
+            is_proxy_mode = true;
+        } else {
+            let _ = fs::remove_file(&config.socket_path);
         }
-    });
+    }
 
-    // 1) udev 감시 허브 백그라운드 구동 (Local Thread)
-    tokio::task::spawn_local(async {
-        let monitor = MonitorBuilder::new()
-            .expect("❌ udev 모니터 생성 실패")
-            .match_subsystem("block")
-            .expect("❌ udev 필터 매칭 실패")
-            .listen()
-            .expect("❌ udev 소켓 바인딩 실패");
+    if !is_proxy_mode {
+        info!("==================================================");
+        info!(" 가람OS 데몬 엔터프라이즈 네이티브 메인 엔진 시동 완료");
+        info!("==================================================");
 
-        loop {
-            if let Some(event) = monitor.iter().next() {
-                let dev_node = event.devnode().unwrap_or(std::path::Path::new("unknown"));
-                let action_type = event.action().unwrap_or(std::ffi::OsStr::new("unknown"));
-                
-                let dev_path = dev_node.to_string_lossy();
-                let action = action_type.to_string_lossy();
-
-                if dev_path.contains("loop") || dev_path.contains("sr") { continue; }
-
-                match action.as_ref() {
-                    "add" => warn!("🔥 [하드웨어 인입 감지] 새로운 스토리지 장장 장착! 👉 장치경로: {}", dev_path),
-                    "remove" => error!("🔴 [하드웨어 위기 감지] 스토리지가 물리적으로 탈거됨! 👉 장치경로: {}", dev_path),
-                    _ => {}
+        // 🔋 [UPS 워치독 태스크]
+        let ups_state_share = Arc::clone(&shared_state);
+        tokio::task::spawn(async move {
+            loop {
+                let ups = tokio::task::spawn_blocking(|| {
+                    UpsController::read_ups_telemetry()
+                })
+                .await
+                .unwrap_or(hardware::power::UpsStatus {
+                    ac_connected: true, battery_pct: 100, ups_voltage: 14.2, backup_time_left_min: 180,
+                });
+                {
+                    let mut lock = ups_state_share.write().await;
+                    lock.ac_connected = ups.ac_connected;
+                    lock.battery_pct = ups.battery_pct;
+                    lock.ups_voltage = ups.ups_voltage;
+                    lock.backup_time_left_min = ups.backup_time_left_min;
                 }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    });
+        });
 
-    let listener = UnixListener::bind(&config.socket_path).unwrap();
-    info!("가람OS 데몬 메인 소켓 리스너 대기 중...");
+        // 📊 [백그라운드 자원 매립 특공대]
+        let state_writer = Arc::clone(&shared_state);
+        tokio::spawn(async move {
+            loop {
+                let metrics = SystemMonitor::fetch_metrics().await;
+                let sda_temp = crate::hardware::disks::get_disk_realtime_temperature_only("sda").await;
+                {
+                    let mut lock = state_writer.write().await;
+                    lock.cpu_usage = metrics.cpu_usage_pct;
+                    lock.ram_used_mb = metrics.ram_used_mb;
+                    lock.ram_total_mb = metrics.ram_total_mb;
+                    lock.ram_pct = metrics.ram_usage_pct.round();
+                    lock.disk_temp = sda_temp;
+                } 
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        });
+
+        // 🐳 도커 안보 중개 엔진
+        let p_path = config.authz_socket_path.clone();
+        let p_mode = config.authz_socket_mode;
+        let p_group = config.authz_group_name.clone();
+        let p_mut = config.enable_auto_mutation;
+        let p_cpu = config.default_cpu_limit;
+        let p_mem = config.default_memory_mb;
+        tokio::spawn(async move {
+            let _ = docker::authz::GaramDockerAuthzEngine::start_checkpoint(&p_path, p_mode, &p_group, p_mut, p_cpu, p_mem).await;
+        });
+    }
+
+    if Path::new(&current_socket_path).exists() {
+        let _ = fs::remove_file(&current_socket_path);
+    }
+    let listener = UnixListener::bind(&current_socket_path).unwrap();
+    let _ = fs::set_permissions(&current_socket_path, fs::Permissions::from_mode(0o770));
+    if let Ok(Some(garam_group)) = Group::from_name(&config.authz_group_name) {
+        let _ = chown(Path::new(&current_socket_path), None, Some(garam_group.gid));
+    }
+
+    info!("📡 가람OS 리스너 가동 채널 개통 완료 -> {}", current_socket_path);
     
+    let state_reader = Arc::clone(&shared_state);
+    let allowed_uids = config.allowed_uids.clone();
+    let original_socket_path = config.socket_path.clone();
+
     loop {
-        if let Ok((mut stream, _)) = listener.accept().await {
-            let mut buffer = [0; 4096]; // 0 초기화 완료 버퍼
-            if let Ok(n) = stream.read(&mut buffer).await {
-                if n == 0 { continue; }
-                let raw_json = String::from_utf8_lossy(&buffer[..n]);
-                
-                let req: IpcRequest = match serde_json::from_str::<IpcRequest>(&raw_json) {
-                    Ok(parsed) => {
-                        info!("CMD 수신: '{}'", parsed.cmd);
-                        parsed
-                    },
-                    Err(_) => {
-                        let _ = stream.write_all("❌ [데몬 에러] 규격 외 프로토콜입니다.\n".as_bytes()).await;
-                        continue;
-                    }
-                };
-
-                let response_message = match req.cmd.as_str() {
-                    "status" => {
-                        let uptime_secs = start_time.elapsed().as_secs();
-                        format!("GaramOS Daemon Running\nNode Name: {}\nUptime: {}s\nVersion: {}\n", config.hostname, uptime_secs, version)
-                    }
-                    // 💡 [조정 완료] 한 단계 쪼개진 hardware::disks 폴더 모듈방으로 우회 호출 대행!
-                    "disk-list" => hardware::disks::get_json_disks(),
-                    "disk-smart" => {
-                        if let Some(disk_target) = req.args.get(0) {
-                            hardware::disks::get_disk_smart(disk_target)
-                        } else {
-                            "❌ [에러] 디스크 이름 누락.\n".to_string()
-                        }
-                    }
-                    "pool-create" => {
-                        if req.args.len() >= 4 {
-                            let pool_name = &req.args[0];
-                            let engine_type = &req.args[1];
-                            let raid_type = &req.args[2];
-                            let disks: Vec<&str> = req.args[3..].iter().map(|s| s.as_str()).collect();
-
-                            let backend: Box<dyn StorageBackend> = match engine_type.as_str() {
-                                "zfs"    => Box::new(ZfsBackend),
-                                "hybrid" => Box::new(GhsBackend),
-                                "lvm"    => Box::new(LvmBackend),
-                                _ => {
-                                    let _ = stream.write_all("❌ 지원하지 않는 엔진.\n".as_bytes()).await;
-                                    continue;
-                                }
-                            };
-
-                            match backend.create_pool(pool_name, raid_type, &disks) {
-                                Ok(report) => report,
-                                Err(err_report) => err_report,
-                            }
-                        } else {
-                            "❌ [에러] 인자 부족.\n".to_string()
-                        }
-                    }
-                    "pool-list" => {
-                        if let Some(engine_type) = req.args.get(0) {
-                            let backend: Box<dyn StorageBackend> = match engine_type.as_str() {
-                                "zfs"    => Box::new(ZfsBackend),
-                                "hybrid" => Box::new(GhsBackend),
-                                "lvm"    => Box::new(LvmBackend),
-                                _ => {
-                                    let _ = stream.write_all("❌ 알 수 없는 엔진.\n".as_bytes()).await;
-                                    continue;
-                                }
-                            };
-                            match backend.list_pools() {
-                                Ok(list) => format!("📄 [{}] 활성화 풀 목록:\n{}", engine_type, list),
-                                Err(e) => e,
-                            }
-                        } else {
-                            "❌ 엔진 타입 누락.\n".to_string()
-                        }
-                    }
-                    _ => "❌ 알 수 없는 명령어입니다.\n".to_string()
-                };
-
-                let _ = stream.write_all(response_message.as_bytes()).await;
+        if let Ok((stream, _)) = listener.accept().await {
+            if let Ok(cred) = stream.peer_cred() {
+                if cred.uid() != 0 && !allowed_uids.contains(&cred.uid()) { continue; }
             }
+
+            let state_reader_clone = Arc::clone(&state_reader);
+            let hostname = config.hostname.clone();
+            let version = version.to_string();
+            let orig_path = original_socket_path.clone();
+
+            tokio::spawn(async move {
+                let (reader, writer) = tokio::io::split(stream);
+                let mut framed_reader = FramedRead::new(reader, LengthDelimitedCodec::new());
+                let mut framed_writer = FramedWrite::new(writer, LengthDelimitedCodec::new());
+
+                // 👑 [프록시 인터셉터]: 프록시 모드이면 명령어를 원본 데몬으로 토스
+                if is_proxy_mode {
+                    if let Ok(main_server_stream) = UnixStream::connect(&orig_path).await {
+                        let (m_reader, m_writer) = tokio::io::split(main_server_stream);
+                        let mut main_reader = FramedRead::new(m_reader, LengthDelimitedCodec::new());
+                        let mut main_writer = FramedWrite::new(m_writer, LengthDelimitedCodec::new());
+
+                        while let Some(Ok(bytes_mut)) = framed_reader.next().await {
+                            if main_writer.send(bytes_mut.freeze()).await.is_ok() {
+                                if let Some(Ok(response_from_main)) = main_reader.next().await {
+                                    let _ = framed_writer.send(response_from_main.freeze()).await;
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+
+                // =========================================================================
+                // 👑 1호기 메인 엔진 전용 실탄 명령어 연산반
+                // =========================================================================
+                while let Some(Ok(bytes_mut)) = framed_reader.next().await {
+                    let req: IpcRequest = match serde_json::from_str(&String::from_utf8_lossy(&bytes_mut)) {
+                        Ok(parsed) => parsed,
+                        Err(_) => continue,
+                    };
+
+                    match req.cmd.as_str() {
+                        "status" => {
+                            let is_watch = req.args.contains(&"w".to_string());
+
+                            if is_watch {
+                                loop {
+                                    let current = state_reader_clone.read().await;
+                                    let live_data = json!({
+                                        "hostname": hostname,
+                                        "uptime_secs": start_time.elapsed().as_secs(),
+                                        "version": version,
+                                        "hardware": {
+                                            "cpu_usage_pct": current.cpu_usage,
+                                            "ram_total_mb": current.ram_total_mb,
+                                            "ram_used_mb": current.ram_used_mb,
+                                            "ram_usage_pct": current.ram_pct,
+                                            "disk_temp": current.disk_temp
+                                        },
+                                        "power_ups": {
+                                            "ac_connected": current.ac_connected,
+                                            "battery_pct": current.battery_pct,
+                                            "voltage": current.ups_voltage,
+                                            "runtime_left_min": current.backup_time_left_min
+                                        }
+                                    });
+                                    drop(current); // RwLock 해제 후 sleep
+
+                                    // ✅ [수정] FramedWrite에 그냥 넘기기만 하면 됨
+                                    // 수동으로 length prefix 붙이지 않음!
+                                    let payload = Bytes::from(live_data.to_string());
+                                    if framed_writer.send(payload).await.is_err() { break; }
+
+                                    tokio::time::sleep(Duration::from_millis(500)).await;
+                                }
+                            } else {
+                                // 단발성 요청
+                                let current = state_reader_clone.read().await;
+                                let live_data = json!({
+                                    "hostname": hostname,
+                                    "uptime_secs": start_time.elapsed().as_secs(),
+                                    "version": version,
+                                    "hardware": {
+                                        "cpu_usage_pct": current.cpu_usage,
+                                        "ram_total_mb": current.ram_total_mb,
+                                        "ram_used_mb": current.ram_used_mb,
+                                        "ram_usage_pct": current.ram_pct,
+                                        "disk_temp": current.disk_temp
+                                    },
+                                    "power_ups": {
+                                        "ac_connected": current.ac_connected,
+                                        "battery_pct": current.battery_pct,
+                                        "voltage": current.ups_voltage,
+                                        "runtime_left_min": current.backup_time_left_min
+                                    }
+                                });
+
+                                // ✅ [수정] 동일하게 FramedWrite에 그냥 넘기기
+                                let payload = Bytes::from(live_data.to_string());
+                                let _ = framed_writer.send(payload).await;
+                            }
+                        }
+                        _ => {
+                            let _ = framed_writer.send(Bytes::from("🔴 [가람OS] 알 수 없는 명령어입니다")).await;
+                        }
+                    }
+                }
+            });
         }
     }
 }
@@ -172,15 +291,8 @@ async fn run_daemon(config: SystemConfig) {
 #[tokio::main]
 async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-
-    let config_content = fs::read_to_string("config.toml")
-        .expect("⚠️ config.toml 파일을 찾을 수 없습니다!");
-    
-    let config: SystemConfig = toml::from_str(&config_content)
-        .expect("⚠️ config.toml 포맷 에러!");
-
-    let _ = fs::remove_file(&config.socket_path);
-
+    let config_content = fs::read_to_string("config.toml").unwrap();
+    let config: SystemConfig = toml::from_str(&config_content).unwrap();
     let local = LocalSet::new();
     local.run_until(run_daemon(config)).await;
 }

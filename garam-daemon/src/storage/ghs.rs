@@ -1,119 +1,159 @@
-use super::StorageBackend;
-use log::{info, warn};
-use std::process::Command;
+//! Garam Hybrid Slicing (GHS) Pure Computation Engine
+//! 
+//! 사장님의 지시대로 물리 제어를 전면 배제하되, 윗선 집행부가 뇌절하지 않도록
+//! 파티션 번호와 섹터 오프셋 족보까지 완벽하게 연산해내는 순수 수학 코어.
 
-pub struct GhsBackend;
+use serde::{Serialize, Deserialize};
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use super::StorageBackend; // 👑 부모 트레이트 명확히 수입!
 
-// 디스크 조각의 연산 상태를 추적하는 구조체
-#[derive(Debug, Clone)]
-struct DiskSlice {
-    name: String,
-    remaining_size: u64, // 단위를 GB 또는 블록 단위로 연산
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum GhsRaidType {
+    Raid1,       // 2대 조각 결속 (골드 존)
+    Raid5,       // 3대 이상 조각 결속 (골드 존)
+    SafeSingle,  // 홀로 남은 자투리 구출 존 (실버 프리 존 ➔ GFS 2번 패리티 자가치유 버프)
 }
 
-impl StorageBackend for GhsBackend {
-    fn create_pool(&self, name: &str, raid_type: &str, disks: &[&str]) -> Result<String, String> {
-        info!("🧠 [GHS 스토리지 코어] 하이브리드 수평 슬라이싱 연산 개시. 대상 디스크: {:?}", disks);
-        
-        if disks.len() < 2 {
-            return Err("❌ GHS 하이브리드 구성을 위해서는 최소 2개 이상의 디스크가 필요합니다.\n".to_string());
-        }
+/// 🧱 GHS 설계도 조각 내부의 '개별 물리 디스크 파티셔닝' 정밀 지침서
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartitionTarget {
+    pub disk_name: String,       // ex: "sdb"
+    pub partition_index: u32,    // ex: 1 -> "sdb1", 2 -> "sdb2"
+    pub start_offset_bytes: u64, // ⚡ sfdisk 매핑용 시작 지점 바이트 오프셋
+}
 
-        // 1. 커널에서 디스크 실제 용량 가상 획득 (가상 시뮬레이션용 하드코딩 데이터 매핑)
-        // 💡 실무 구현 시에는 lsblk 가이트에서 구한 값을 매핑합니다. 
-        // 시뮬레이션 예시: sda=400GB, sdb=400GB, sdc=800GB, sdd=800GB
-        let mut disk_pool: Vec<DiskSlice> = disks.iter().map(|d| {
-            let mock_size = match *d {
-                "sda" | "sdb" => 400,
-                _ => 800,
-            };
-            DiskSlice { name: d.to_string(), remaining_size: mock_size }
-        }).collect();
+/// GHS 연산 엔진이 최종 출력할 '수평 파티션 설계도'의 1개 층 조각 명세서
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GhsSlicePlan {
+    pub slice_index: u32,
+    pub chunk_size_bytes: u64,
+    pub raid_type: GhsRaidType,
+    pub targets: Vec<PartitionTarget>, // 👑 윗선 집행부가 1초 컷으로 조작할 정밀 명부
+}
 
-        let mut slice_index = 1;
-        let mut created_md_devices = Vec::new();
-        let mut report = String::new();
+pub struct PureGhsEngine {
+    pub input_disks: Vec<(String, u64)>,
+}
 
-        report.push_str(&format!("🏗️ [GHS 코어] 풀 '{}' 수평 칼질 연산 보고서\n", name));
-        report.push_str("==================================================\n");
-
-        // 2. 루프를 돌며 자투리 공간이 안 남을 때까지 수평 칼질 무한 사냥
-        loop {
-            // 남은 용량이 0보다 큰 디스크들만 필터링하고 용량 기준 오름차순 정렬
-            disk_pool.retain(|d| d.remaining_size > 0);
-            if disk_pool.is_empty() { break; }
-            
-            disk_pool.sort_by_key(|d| d.remaining_size);
-
-            // 현재 라운드에서 깎아낼 최소 기준 용량 산정
-            let min_chunk = disk_pool[0].remaining_size;
-            let available_disks: Vec<String> = disk_pool.iter().map(|d| d.name.clone()).collect();
-            let disk_count = available_disks.len();
-
-            if disk_count < 2 {
-                warn!("⚠️ 자투리 디스크가 1개만 남았습니다. (크기: {}GB). 이 공간은 패리티 보호가 불가능하므로 GHS가 보호 유령 공간으로 동결합니다.", min_chunk);
-                break;
-            }
-
-            // 이번 라운드 칼질 레이드 성향 매칭
-            let current_raid = match disk_count {
-                2 => "raid1",
-                _ => if raid_type == "auto" || raid_type == "raid5" { "raid5" } else { "raid6" },
-            };
-
-            let md_dev = format!("/dev/md_ghs_{}_{}", name, slice_index);
-            report.push_str(&format!(
-                "▶️ [{}] 층 수평 슬라이싱 분할 완료\n", slice_index
-            ));
-            report.push_str(&format!(
-                "   • 참여 디스크 ({}-Disks): {:?}\n", disk_count, available_disks
-            ));
-            report.push_str(&format!(
-                "   • 컷팅 두께: 각 {} GB | 매핑 아키텍처: {}\n", min_chunk, current_raid
-            ));
-
-            // 💡 [실제 커널 제어부] mdadm 명령어로 가상 파티션 레이드 빌드
-            // 실제 리눅스 환경에서 작동할 때는 아래 주석처리된 커널 가동 벨트가 동작합니다.
-            /*
-            let mut mdadm_cmd = Command::new("mdadm");
-            mdadm_cmd.arg("--create").arg(&md_dev).arg("--level").arg(current_raid.replace("raid", "")).arg("--raid-devices").arg(disk_count.to_string());
-            for d in &available_disks { mdadm_cmd.arg(format!("/dev/{}", d)); }
-            let _ = mdadm_cmd.output();
-            */
-
-            created_md_devices.push(md_dev);
-
-            // 차감 연산 진행
-            for d in &mut disk_pool {
-                d.remaining_size -= min_chunk;
-            }
-            slice_index += 1;
-        }
-
-        report.push_str("--------------------------------------------------\n");
-        report.push_str("🧱 3단계: 파티션 조각 LVM 본드 결합 합체 공정\n");
-        report.push_str(&format!("   • 가상 그룹(VG) 명명: vg_{}\n", name));
-        report.push_str(&format!("   • 결합 대상 레이드 조각: {:?}\n", created_md_devices));
-
-        // 💡 [실제 커널 제어부] LVM으로 찢어진 레이드 볼륨 싹 묶어버리기
-        /*
-        let _pv = Command::new("pvcreate").args(&created_md_devices).output();
-        let _vg = Command::new("vgcreate").arg(format!("vg_{}", name)).args(&created_md_devices).output();
-        let _lv = Command::new("lvcreate").arg("-l").arg("100%FREE").arg("-n").arg("data").arg(format!("vg_{}", name)).output();
-        let _mkfs = Command::new("mkfs.ext4").arg(format!("/dev/vg_{}/data", name)).output();
-        */
-
-        report.push_str("==================================================\n");
-        report.push_str("🟢 [성공] 가람 하이브리드 시스템(GHS) 볼륨 빌드가 완료되었습니다! (용량 효율 100% 사수)\n");
-
-        Ok(report)
+impl PureGhsEngine {
+    pub fn new(disks: Vec<(String, u64)>) -> Self {
+        Self { input_disks: disks }
     }
 
-    fn list_pools(&self) -> Result<String, String> {
-        let output = Command::new("vgs").output();
-        match output {
-            Ok(out) if out.status.success() => Ok(String::from_utf8_lossy(&out.stdout).into_owned()),
-            _ => Err("❌ GHS(LVM) 가상 볼륨 그룹을 커널에서 낚아채지 못했습니다.\n".to_string()),
+    /// 🧠 [GHS 심장 수식]: 무한 루프 탈거 후 재귀 가속 파이프라인으로 전격 리팩토링!
+    pub fn generate_slicing_blueprint(&self) -> Vec<GhsSlicePlan> {
+        let disk_pool: Vec<(String, u64)> = self.input_disks.clone();
+        
+        // 🛡️ 고정 불멸의 전역 디스크 족보 추적 장부
+        let disk_tracker: HashMap<String, (u64, u32)> = self.input_disks
+            .iter()
+            .map(|(name, _)| (name.clone(), (0u64, 1u32)))
+            .collect();
+
+        // 초기 수색대 결과 배열
+        let blueprints = Vec::new();
+
+        // 🔄 [재귀 전차 시동]: 1번 슬라이스 층부터 재귀 엔진 구동!
+        // 동기 함수 내에서 비동기 스타일 힙 핀을 사용해 동적 호출 스택을 제어합니다.
+        let fut = slice_core_recursive(disk_pool, disk_tracker, 1, blueprints);
+        
+        // 블로킹 방식으로 재귀 최종 결과물 인출 (순수 연산이므로 오버헤드 무부하)
+        futures::executor::block_on(fut)
+    }
+}
+
+/// 🔄 [GHS 전용 핵심 재귀 파이프라인]: 수평 층 분할 정복 기법 완공
+fn slice_core_recursive(
+    mut disk_pool: Vec<(String, u64)>,
+    mut disk_tracker: HashMap<String, (u64, u32)>,
+    slice_index: u32,
+    mut blueprints: Vec<GhsSlicePlan>,
+) -> Pin<Box<dyn Future<Output = Vec<GhsSlicePlan>> + Send>> {
+    Box::pin(async move {
+        // 1. 🧼 [용량 연소 하드 정제]
+        disk_pool.retain(|d| d.1 > 0);
+
+        // 🛑 [기저 조건 / Base Case]: 모든 자투리 용량이 100% 연소되면 즉시 재귀 탈출!
+        if disk_pool.is_empty() {
+            return blueprints;
         }
+
+        // 2. ⚖️ 남은 용량 기준 정렬 및 가용 최소 chunk 추출
+        disk_pool.sort_by_key(|d| d.1);
+        let min_chunk_bytes = disk_pool[0].1;
+        let available_disks: Vec<String> = disk_pool.iter().map(|d| d.0.clone()).collect();
+        let disk_count = available_disks.len();
+
+        // 🚨 [재귀 분기 A]: 홀로 남은 자투리 디스크 독박 처리 명세 발행 및 최종 마감
+        if disk_count < 2 {
+            let lone_disk_name = &disk_pool[0].0;
+            let (offset, part_idx) = disk_tracker.get(lone_disk_name).cloned().unwrap_or((0, 1));
+
+            blueprints.push(GhsSlicePlan {
+                slice_index,
+                chunk_size_bytes: min_chunk_bytes,
+                raid_type: GhsRaidType::SafeSingle,
+                targets: vec![PartitionTarget {
+                    disk_name: lone_disk_name.clone(),
+                    partition_index: part_idx,
+                    start_offset_bytes: offset,
+                }],
+            });
+            return blueprints; // 자투리까지 전량 구출 완료로 재귀 종결
+        }
+
+        // 3. 👑 황금 레이드 스펙 매칭 
+        let raid_type = match disk_count {
+            2 => GhsRaidType::Raid1,
+            _ => GhsRaidType::Raid5,
+        };
+
+        // 4. 이번 층 레이드 파티션 지침서 조립
+        let mut targets = Vec::new();
+        for d_name in &available_disks {
+            let (offset, part_idx) = disk_tracker.get(d_name).cloned().unwrap_or((0, 1));
+            
+            targets.push(PartitionTarget {
+                disk_name: d_name.clone(),
+                partition_index: part_idx,
+                start_offset_bytes: offset,
+            });
+
+            // 🔄 파티션 족보 전진 및 갱신
+            if let Some(track) = disk_tracker.get_mut(d_name) {
+                track.0 += min_chunk_bytes; 
+                track.1 += 1;               
+            }
+        }
+
+        blueprints.push(GhsSlicePlan {
+            slice_index,
+            chunk_size_bytes: min_chunk_bytes,
+            raid_type,
+            targets,
+        });
+
+        // 5. 🔪 연산상 두께 차감
+        for d in &mut disk_pool {
+            d.1 -= min_chunk_bytes;
+        }
+
+        // 🔄 [꼬리 재귀 호출 / Tail Call]: 다음 층 명부들을 짊어지고 다음 스택 방으로 수평 진격!
+        slice_core_recursive(disk_pool, disk_tracker, slice_index + 1, blueprints).await
+    })
+}
+
+// =========================================================================
+// 👑 [백엔드 연결 문지기] - 순정 100% 동일 유지
+// =========================================================================
+pub struct GhsBackend;
+
+impl StorageBackend for GhsBackend {
+    fn generate_blueprint(&self, _pool_name: &str, disks: &[(String, u64)]) -> Result<Vec<GhsSlicePlan>, String> {
+        let pure_engine = PureGhsEngine::new(disks.to_vec());
+        let blueprint = pure_engine.generate_slicing_blueprint();
+        Ok(blueprint)
     }
 }
